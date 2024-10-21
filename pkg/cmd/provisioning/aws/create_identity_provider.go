@@ -32,6 +32,7 @@ var (
 		Region:        "",
 		PublicKeyPath: "",
 		TargetDir:     "",
+		CustomIssuerUrl: "",
 	}
 
 	// S3 bucket template (usable with aws CLI --cli-input-json param)
@@ -241,21 +242,30 @@ var (
 	cloudFrontDistributionFilename                     = "08-cloudfront-distribution.json"
 )
 
-func createIdentityProvider(client aws.Client, name, region, publicKeyPath, targetDir string, createPrivateS3, generateOnly bool) (string, error) {
-	// Create the S3 bucket and (if specified) a CloudFront Distribution to serve OIDC endpoint
+func createIdentityProvider(client aws.Client, name, region, publicKeyPath, targetDir string, createPrivateS3, generateOnly bool, customIssuerUrl string) (string, error) {
+	var issuerURL string
+	customIssuer := false
 	bucketName := fmt.Sprintf("%s-oidc", name)
-	issuerURL, err := createOIDCEndpoint(client, bucketName, name, region, targetDir, createPrivateS3, generateOnly)
-	if err != nil {
-		return "", err
+	if customIssuerUrl == "" {
+		// Create the S3 bucket and (if specified) a CloudFront Distribution to serve OIDC endpoint
+		url, err := createOIDCEndpoint(client, bucketName, name, region, targetDir, createPrivateS3, generateOnly)
+		if err != nil {
+			return "", err
+		}
+		issuerURL = url
+	} else {
+		customIssuer = true
+		issuerURL = customIssuerUrl
 	}
 
+
 	// Create the OIDC config file
-	if err := createOIDCConfiguration(client, bucketName, issuerURL, name, targetDir, createPrivateS3, generateOnly); err != nil {
+	if err := createOIDCConfiguration(client, bucketName, issuerURL, name, targetDir, createPrivateS3, generateOnly, customIssuer); err != nil {
 		return "", err
 	}
 
 	// Create the OIDC key list
-	if err := createJSONWebKeySet(client, publicKeyPath, bucketName, name, targetDir, createPrivateS3, generateOnly); err != nil {
+	if err := createJSONWebKeySet(client, publicKeyPath, bucketName, name, targetDir, createPrivateS3, generateOnly, customIssuer); err != nil {
 		return "", err
 	}
 
@@ -374,7 +384,7 @@ func createIAMIdentityProvider(client aws.Client, issuerURL, name, targetDir str
 	return providerARN, nil
 }
 
-func createJSONWebKeySet(client aws.Client, publicKeyFilepath, bucketName, name, targetDir string, createPrivateS3, generateOnly bool) error {
+func createJSONWebKeySet(client aws.Client, publicKeyFilepath, bucketName, name, targetDir string, createPrivateS3, generateOnly, customIssuer bool) error {
 	jwks, err := provisioning.BuildJsonWebKeySet(publicKeyFilepath)
 	if err != nil {
 		return errors.Wrap(err, "failed to build JSON web key set from the public key")
@@ -387,22 +397,26 @@ func createJSONWebKeySet(client aws.Client, publicKeyFilepath, bucketName, name,
 			return errors.Wrap(err, fmt.Sprintf("Failed to save JSON web key set (JWKS) locally at %s", oidcKeysFullPath))
 		}
 	} else {
-		_, err = client.PutObject(&s3.PutObjectInput{
-			Body:    awssdk.ReadSeekCloser(bytes.NewReader(jwks)),
-			Bucket:  awssdk.String(bucketName),
-			Key:     awssdk.String(provisioning.KeysURI),
-			Tagging: awssdk.String(fmt.Sprintf("%s/%s=%s&%s=%s", ccoctlAWSResourceTagKeyPrefix, name, ownedCcoctlAWSResourceTagValue, nameTagKey, name)),
-		})
+		if customIssuer {
+			log.Printf("JSON web key set (JWKS) selfhosted content: \n%s", string(jwks))
+		} else {
+			_, err = client.PutObject(&s3.PutObjectInput{
+				Body:    awssdk.ReadSeekCloser(bytes.NewReader(jwks)),
+				Bucket:  awssdk.String(bucketName),
+				Key:     awssdk.String(provisioning.KeysURI),
+				Tagging: awssdk.String(fmt.Sprintf("%s/%s=%s&%s=%s", ccoctlAWSResourceTagKeyPrefix, name, ownedCcoctlAWSResourceTagValue, nameTagKey, name)),
+			})
 
-		if err != nil {
-			return errors.Wrapf(err, "failed to upload JSON web key set (JWKS) in the S3 bucket %s", bucketName)
+			if err != nil {
+				return errors.Wrapf(err, "failed to upload JSON web key set (JWKS) in the S3 bucket %s", bucketName)
+			}
+			log.Printf("JSON web key set (JWKS) in the S3 bucket %s at %s updated", bucketName, provisioning.KeysURI)
 		}
-		log.Printf("JSON web key set (JWKS) in the S3 bucket %s at %s updated", bucketName, provisioning.KeysURI)
 	}
 	return nil
 }
 
-func createOIDCConfiguration(client aws.Client, bucketName, issuerURL, name, targetDir string, createPrivateS3, generateOnly bool) error {
+func createOIDCConfiguration(client aws.Client, bucketName, issuerURL, name, targetDir string, createPrivateS3, generateOnly, customIssuer bool) error {
 	discoveryDocumentJSON := fmt.Sprintf(provisioning.DiscoveryDocumentTemplate, issuerURL, issuerURL, provisioning.KeysURI)
 	if generateOnly {
 		oidcConfigurationFullPath := filepath.Join(targetDir, oidcConfigurationFilename)
@@ -411,16 +425,20 @@ func createOIDCConfiguration(client aws.Client, bucketName, issuerURL, name, tar
 			return errors.Wrap(err, fmt.Sprintf("Failed to save discovery document locally at %s", oidcConfigurationFullPath))
 		}
 	} else {
-		_, err := client.PutObject(&s3.PutObjectInput{
-			Body:    awssdk.ReadSeekCloser(strings.NewReader(discoveryDocumentJSON)),
-			Bucket:  awssdk.String(bucketName),
-			Key:     awssdk.String(provisioning.DiscoveryDocumentURI),
-			Tagging: awssdk.String(fmt.Sprintf("%s/%s=%s&%s=%s", ccoctlAWSResourceTagKeyPrefix, name, ownedCcoctlAWSResourceTagValue, nameTagKey, name)),
-		})
-		if err != nil {
-			return errors.Wrapf(err, "failed to upload discovery document in the S3 bucket %s", bucketName)
+		if customIssuer {
+			log.Printf("OpenID Connect discovery document selfhosted content: \n%s", discoveryDocumentJSON)
+		} else {
+			_, err := client.PutObject(&s3.PutObjectInput{
+				Body:    awssdk.ReadSeekCloser(strings.NewReader(discoveryDocumentJSON)),
+				Bucket:  awssdk.String(bucketName),
+				Key:     awssdk.String(provisioning.DiscoveryDocumentURI),
+				Tagging: awssdk.String(fmt.Sprintf("%s/%s=%s&%s=%s", ccoctlAWSResourceTagKeyPrefix, name, ownedCcoctlAWSResourceTagValue, nameTagKey, name)),
+			})
+			if err != nil {
+				return errors.Wrapf(err, "failed to upload discovery document in the S3 bucket %s", bucketName)
+			}
+			log.Printf("OpenID Connect discovery document in the S3 bucket %s at %s updated", bucketName, provisioning.DiscoveryDocumentURI)
 		}
-		log.Printf("OpenID Connect discovery document in the S3 bucket %s at %s updated", bucketName, provisioning.DiscoveryDocumentURI)
 	}
 	return nil
 }
@@ -708,7 +726,7 @@ func createIdentityProviderCmd(cmd *cobra.Command, args []string) {
 		publicKeyPath = filepath.Join(CreateIdentityProviderOpts.TargetDir, provisioning.PublicKeyFile)
 	}
 
-	_, err = createIdentityProvider(awsClient, CreateIdentityProviderOpts.Name, CreateIdentityProviderOpts.Region, publicKeyPath, CreateIdentityProviderOpts.TargetDir, CreateIdentityProviderOpts.CreatePrivateS3Bucket, CreateIdentityProviderOpts.DryRun)
+	_, err = createIdentityProvider(awsClient, CreateIdentityProviderOpts.Name, CreateIdentityProviderOpts.Region, publicKeyPath, CreateIdentityProviderOpts.TargetDir, CreateIdentityProviderOpts.CreatePrivateS3Bucket, CreateIdentityProviderOpts.DryRun, CreateIdentityProviderOpts.CustomIssuerUrl)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -762,6 +780,7 @@ func NewCreateIdentityProviderCmd() *cobra.Command {
 	createIdentityProviderCmd.PersistentFlags().BoolVar(&CreateIdentityProviderOpts.DryRun, "dry-run", false, "Skip creating objects, and just save what would have been created into files")
 	createIdentityProviderCmd.PersistentFlags().StringVar(&CreateIdentityProviderOpts.TargetDir, "output-dir", "", "Directory to place generated files (defaults to current directory)")
 	createIdentityProviderCmd.PersistentFlags().BoolVar(&CreateIdentityProviderOpts.CreatePrivateS3Bucket, "create-private-s3-bucket", false, "Create private S3 bucket with public CloudFront OIDC endpoint")
+	createIdentityProviderCmd.PersistentFlags().StringVar(&CreateIdentityProviderOpts.CustomIssuerUrl, "custom-issuer-url", "", "Custom issuer url which selfhosting wellknown and jwks url (This option will disable creating s3 bucket/cloudfront. Default to \"\")")
 
 	return createIdentityProviderCmd
 }

@@ -17,6 +17,7 @@ type options struct {
 	CredRequestDir         string
 	IdentityProviderARN    string
 	PermissionsBoundaryARN string
+	CustomIssuerUrl        string
 	DryRun                 bool
 	EnableTechPreview      bool
 	CreatePrivateS3Bucket  bool
